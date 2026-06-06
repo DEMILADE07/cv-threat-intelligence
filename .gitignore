@@ -25,3 +25,7 @@ external/Weapon-Detection-System/
 *.log
 Thumbs.db
 desktop.ini
+
+# Scratch folders from unzipping Office docs — not source
+.tmp_gtm_docx/
+.tmp_xlsx/

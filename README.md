@@ -136,6 +136,34 @@ Recommended violence test command:
 python detector.py --source 0 --weights yolov8n.pt --person-weights yolov8n.pt --weapon-weights "models\weapon_best.pt" --weapon-loader yolov5 --pose-weights yolov8n-pose.pt --person-classes person --weapon-classes knife,gun --threat-classes knife,gun --weapon-conf 0.80 --min-threat-frames 3 --violence-min-frames 4 --debug-weapon --debug-violence --show
 ```
 
+## Clip-Based Violence Layer
+There is now also an optional clip-based violence classifier built on top of `torchvision` video models.
+
+What it does right now:
+- keeps a short frame buffer
+- runs a pretrained `r3d_18` Kinetics-400 classifier every few frames
+- looks for labels such as `punching person (boxing)`, `wrestling`, and `sword fighting`
+- fuses that signal with detected people and validated weapons
+
+This is the fastest path to get a motion-based violence signal into the demo without training a new action-recognition model first.
+
+Recommended clip-violence test command:
+
+```powershell
+python detector.py --source 0 --weights yolov8n.pt --person-weights yolov8n.pt --weapon-weights "models\weapon_best.pt" --weapon-loader yolov5 --pose-weights yolov8n-pose.pt --clip-violence-model r3d_18 --clip-violence-threshold 0.15 --clip-violence-interval 4 --clip-buffer-frames 16 --clip-topk 5 --person-classes person --weapon-classes knife,gun --threat-classes knife,gun --weapon-conf 0.80 --min-threat-frames 2 --violence-min-frames 3 --debug-weapon --debug-violence --show
+```
+
+Current clip-model mapping:
+- `sword fighting` + visible `knife` + at least 2 people -> `POSSIBLE STABBING`
+- `punching person (boxing)` + at least 2 people -> `PHYSICAL FIGHT`
+- `wrestling` + at least 2 people -> `PHYSICAL FIGHT`
+- fight-like clip labels + visible `gun` -> `POSSIBLE ARMED ASSAULT`
+
+Important:
+- this clip model is still generic Kinetics-400 pretraining, not Nigerian-context fine-tuning
+- it is best treated as an extra violence signal for the demo, not as a final production violence model
+- on CPU, keep the default `--clip-violence-interval 4` or higher so inference stays usable
+
 If you want to temporarily disable pose-based violence logic:
 
 ```powershell
@@ -150,6 +178,7 @@ Expected on-screen states:
 Important:
 - these higher-level states are currently heuristic
 - they are meant for the same-day POC demo layer, not as final action-recognition claims
+- the clip-based violence layer improves motion awareness, but real production performance will still require training on your own scenario clips
 
 ## Evidence Output
 Detections are saved under `runs\detect\`.

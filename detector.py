@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 import torch
 from ultralytics import YOLO
+from torchvision.models.video import R3D_18_Weights, r3d_18
 
 warnings.filterwarnings(
     "ignore",
@@ -48,6 +50,16 @@ class LoadedModel:
     kind: str
     names: dict[int, str]
     source_path: str
+
+
+@dataclass
+class LoadedVideoModel:
+    runner: Any
+    labels: list[str]
+    preprocess: Any
+    source_path: str
+    device: torch.device
+    clip_len: int
 
 
 @dataclass
@@ -143,6 +155,14 @@ class EventRecorder:
         self.event_dir = None
         self.clip_path = None
         self.event_deadline = 0.0
+
+
+@dataclass
+class ClipViolencePrediction:
+    active: bool
+    label: str
+    confidence: float
+    top_labels: list[tuple[str, float]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -338,6 +358,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print exact violence heuristic signals when they change.",
     )
+    parser.add_argument(
+        "--clip-violence-model",
+        default="none",
+        choices=("none", "r3d_18"),
+        help="Optional clip-based violence model. `r3d_18` uses a pretrained Kinetics-400 video classifier from torchvision.",
+    )
+    parser.add_argument(
+        "--clip-violence-threshold",
+        type=float,
+        default=0.15,
+        help="Minimum confidence for relevant clip-action labels before they affect the threat state.",
+    )
+    parser.add_argument(
+        "--clip-violence-interval",
+        type=int,
+        default=4,
+        help="Run clip-based violence inference every N frames to reduce CPU load.",
+    )
+    parser.add_argument(
+        "--clip-buffer-frames",
+        type=int,
+        default=16,
+        help="How many recent frames to keep for clip-based violence inference.",
+    )
+    parser.add_argument(
+        "--clip-topk",
+        type=int,
+        default=5,
+        help="How many top clip-model labels to keep for debugging and threat fusion.",
+    )
     return parser.parse_args()
 
 
@@ -400,6 +450,27 @@ def load_detection_model(weights: str, yolov5_repo: str, preferred_kind: str = "
         if "models.yolo" not in str(exc):
             raise
         return load_yolov5_model(weights, yolov5_repo)
+
+
+def load_clip_violence_model(model_name: str) -> LoadedVideoModel | None:
+    if model_name == "none":
+        return None
+    if model_name != "r3d_18":
+        raise ValueError(f"Unsupported clip violence model: {model_name}")
+
+    weights = R3D_18_Weights.DEFAULT
+    runner = r3d_18(weights=weights)
+    runner.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    runner.to(device)
+    return LoadedVideoModel(
+        runner=runner,
+        labels=list(weights.meta["categories"]),
+        preprocess=weights.transforms(),
+        source_path="torchvision:r3d_18",
+        device=device,
+        clip_len=16,
+    )
 
 
 POSE_KEYPOINT_INDEX = {
@@ -1093,6 +1164,142 @@ def assess_violence(
     )
 
 
+def classify_clip_violence(
+    model: LoadedVideoModel | None,
+    frame_buffer: deque[np.ndarray],
+    topk: int,
+) -> ClipViolencePrediction:
+    if model is None or len(frame_buffer) < model.clip_len:
+        return ClipViolencePrediction(active=False, label="", confidence=0.0, top_labels=[])
+
+    frame_indices = np.linspace(0, len(frame_buffer) - 1, num=model.clip_len, dtype=int)
+    sampled_frames = [
+        torch.from_numpy(frame_buffer[index].copy()).permute(2, 0, 1)
+        for index in frame_indices
+    ]
+    clip_tensor = torch.stack(sampled_frames, dim=0)
+    inputs = model.preprocess(clip_tensor).unsqueeze(0).to(model.device)
+
+    with torch.inference_mode():
+        logits = model.runner(inputs)
+        probabilities = torch.softmax(logits, dim=1)[0].detach().cpu()
+
+    top_count = max(1, min(topk, len(model.labels)))
+    top_values, top_indices = torch.topk(probabilities, k=top_count)
+    top_labels = [
+        (model.labels[index], float(value))
+        for value, index in zip(top_values.tolist(), top_indices.tolist())
+    ]
+    best_label, best_confidence = top_labels[0]
+    return ClipViolencePrediction(
+        active=True,
+        label=best_label,
+        confidence=best_confidence,
+        top_labels=top_labels,
+    )
+
+
+def build_clip_debug_signature(prediction: ClipViolencePrediction) -> str:
+    if not prediction.active:
+        return ""
+    return " | ".join(f"{label}={confidence:.2f}" for label, confidence in prediction.top_labels)
+
+
+def assess_clip_violence(
+    prediction: ClipViolencePrediction,
+    validated_weapon_detections: list[Detection],
+    person_detections: list[Detection],
+    confidence_threshold: float,
+) -> ThreatAssessment:
+    if not prediction.active:
+        return ThreatAssessment(
+            active=False,
+            title="CLEAR",
+            level="none",
+            reasons=[],
+            weapon_labels=[],
+            explicit_labels=[],
+        )
+
+    score_by_label = {label: confidence for label, confidence in prediction.top_labels}
+    relevant_scores = {
+        "punching person (boxing)": score_by_label.get("punching person (boxing)", 0.0),
+        "wrestling": score_by_label.get("wrestling", 0.0),
+        "sword fighting": score_by_label.get("sword fighting", 0.0),
+    }
+    strongest_label = max(relevant_scores, key=relevant_scores.get)
+    strongest_confidence = relevant_scores[strongest_label]
+    if strongest_confidence < confidence_threshold:
+        return ThreatAssessment(
+            active=False,
+            title="CLEAR",
+            level="none",
+            reasons=[],
+            weapon_labels=[],
+            explicit_labels=[],
+        )
+
+    weapon_labels = summarize_labels(validated_weapon_detections)
+    person_count = len(person_detections)
+    top_summary = ", ".join(f"{label}={confidence:.2f}" for label, confidence in prediction.top_labels[:3])
+
+    if strongest_label == "sword fighting" and "knife" in weapon_labels and person_count >= 2:
+        return ThreatAssessment(
+            active=True,
+            title="POSSIBLE STABBING",
+            level="critical",
+            reasons=[
+                f"Clip model matched sword-fighting motion ({strongest_confidence:.2f})",
+                f"Knife visible with {person_count} people in frame",
+                f"Top clip labels: {top_summary}",
+            ],
+            weapon_labels=weapon_labels,
+            explicit_labels=[],
+        )
+
+    if strongest_label in {"punching person (boxing)", "wrestling"} and person_count >= 2:
+        if "gun" in weapon_labels:
+            title = "POSSIBLE ARMED ASSAULT"
+            level = "critical"
+        else:
+            title = "PHYSICAL FIGHT"
+            level = "warning"
+        return ThreatAssessment(
+            active=True,
+            title=title,
+            level=level,
+            reasons=[
+                f"Clip model matched {strongest_label} ({strongest_confidence:.2f})",
+                f"{person_count} people visible in frame",
+                f"Top clip labels: {top_summary}",
+            ],
+            weapon_labels=weapon_labels,
+            explicit_labels=[],
+        )
+
+    return ThreatAssessment(
+        active=False,
+        title="CLEAR",
+        level="none",
+        reasons=[],
+        weapon_labels=[],
+        explicit_labels=[],
+    )
+
+
+def choose_stronger_assessment(
+    primary: ThreatAssessment,
+    secondary: ThreatAssessment,
+) -> ThreatAssessment:
+    def score(assessment: ThreatAssessment) -> tuple[int, int, int]:
+        level_score = {"none": 0, "warning": 1, "pending": 2, "critical": 3}.get(assessment.level, 0)
+        active_score = 1 if assessment.active else 0
+        reason_score = len(assessment.reasons)
+        return active_score, level_score, reason_score
+
+    return secondary if score(secondary) > score(primary) else primary
+
+
 def draw_detections(
     frame: Any,
     detections: list[Detection],
@@ -1194,6 +1401,7 @@ def main() -> None:
     weapon_classes = normalize_threat_classes(args.weapon_classes)
     output_root = Path(args.save_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    clip_buffer_size = max(8, args.clip_buffer_frames)
 
     print("Loading model...")
     default_model = load_detection_model(args.weights, args.yolov5_repo)
@@ -1204,6 +1412,7 @@ def main() -> None:
         else None
     )
     pose_model = load_ultralytics_model(args.pose_weights) if args.pose_weights else None
+    clip_violence_model = load_clip_violence_model(args.clip_violence_model)
     label_map = default_model.names
 
     print(f"Configured threat classes: {sorted(threat_classes)}")
@@ -1217,6 +1426,11 @@ def main() -> None:
         print(f"Loaded dedicated weapon model: {weapon_model.source_path} ({weapon_model.kind})")
     if pose_model is not None:
         print(f"Loaded pose model: {pose_model.source_path} ({pose_model.kind})")
+    if clip_violence_model is not None:
+        print(
+            "Loaded clip violence model: "
+            f"{clip_violence_model.source_path} on {clip_violence_model.device.type}"
+        )
 
     capture = open_capture(source)
     source_name = str(source)
@@ -1239,6 +1453,8 @@ def main() -> None:
     previous_pose_people: list[PosePersonState] = []
     pose_track_history: dict[int, deque[PosePersonState]] = {}
     next_pose_track_id = 1
+    clip_frame_buffer: deque[np.ndarray] = deque(maxlen=clip_buffer_size)
+    last_clip_prediction = ClipViolencePrediction(active=False, label="", confidence=0.0, top_labels=[])
 
     print("Starting inference loop. Press 'q' to quit.")
     try:
@@ -1247,6 +1463,8 @@ def main() -> None:
             if not ok:
                 print("Stream ended or frame could not be read.")
                 break
+
+            clip_frame_buffer.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
             detections = predict_with_model(
                 default_model,
@@ -1293,24 +1511,17 @@ def main() -> None:
                 pose_people = enrich_pose_people_with_history(pose_people, pose_track_history)
                 previous_pose_people = list(pose_people)
 
-            raw_object_assessment = assess_threat(
-                detections=detections,
-                threat_classes=threat_classes,
-                person_classes=person_classes,
-                validated_weapon_detections=validate_weapon_detections(
-                    detections=detections,
-                    weapon_classes=weapon_classes,
-                    person_classes=person_classes,
-                    pose_people=pose_people,
-                    frame_shape=frame.shape,
-                    weapon_min_area_ratio=args.weapon_min_area_ratio,
-                    weapon_max_area_ratio=args.weapon_max_area_ratio,
-                    weapon_border_margin_ratio=args.weapon_border_margin_ratio,
-                    weapon_hand_distance_ratio=args.weapon_hand_distance_ratio,
-                    allow_unattached_weapons=args.allow_unattached_weapons,
-                ),
-                assault_distance_ratio=args.assault_distance_ratio,
-            )
+            if (
+                clip_violence_model is not None
+                and len(clip_frame_buffer) >= clip_violence_model.clip_len
+                and frame_count % max(1, args.clip_violence_interval) == 0
+            ):
+                last_clip_prediction = classify_clip_violence(
+                    model=clip_violence_model,
+                    frame_buffer=clip_frame_buffer,
+                    topk=args.clip_topk,
+                )
+
             validated_weapon_detections = validate_weapon_detections(
                 detections=detections,
                 weapon_classes=weapon_classes,
@@ -1323,13 +1534,30 @@ def main() -> None:
                 weapon_hand_distance_ratio=args.weapon_hand_distance_ratio,
                 allow_unattached_weapons=args.allow_unattached_weapons,
             )
-            raw_violence_assessment = assess_violence(
+            raw_object_assessment = assess_threat(
+                detections=detections,
+                threat_classes=threat_classes,
+                person_classes=person_classes,
+                validated_weapon_detections=validated_weapon_detections,
+                assault_distance_ratio=args.assault_distance_ratio,
+            )
+            raw_pose_violence_assessment = assess_violence(
                 pose_people=pose_people,
                 validated_weapon_detections=validated_weapon_detections,
                 violence_distance_ratio=args.violence_distance_ratio,
                 violence_wrist_speed=args.violence_wrist_speed,
                 violence_arm_extension_ratio=args.violence_arm_extension_ratio,
                 weapon_hand_distance_ratio=args.weapon_hand_distance_ratio,
+            )
+            raw_clip_violence_assessment = assess_clip_violence(
+                prediction=last_clip_prediction,
+                validated_weapon_detections=validated_weapon_detections,
+                person_detections=filter_detections_by_labels(detections, person_classes),
+                confidence_threshold=args.clip_violence_threshold,
+            )
+            raw_violence_assessment = choose_stronger_assessment(
+                raw_pose_violence_assessment,
+                raw_clip_violence_assessment,
             )
 
             if raw_object_assessment.active:
@@ -1364,10 +1592,12 @@ def main() -> None:
                         print("Weapon detections cleared")
                     last_weapon_debug_signature = current_weapon_debug_signature
 
-            if args.debug_violence and pose_model is not None:
+            if args.debug_violence and (pose_model is not None or clip_violence_model is not None):
+                clip_debug_signature = build_clip_debug_signature(last_clip_prediction)
                 current_violence_debug_signature = (
                     f"{assessment.title} :: {build_pose_debug_signature(pose_people)}"
-                    if pose_people
+                    f"{' :: clip=' + clip_debug_signature if clip_debug_signature else ''}"
+                    if pose_people or clip_debug_signature
                     else ""
                 )
                 if current_violence_debug_signature != last_violence_debug_signature:
