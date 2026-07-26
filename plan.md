@@ -162,18 +162,22 @@ The mapper should seed per-camera context and later help generate preset suggest
 - Artifact leakage bug in gate frame saving was identified and fixed.
 - A first 9-clip quick eval file exists: `tools/gate_bakeoff_labels_9.json`.
 - Ayo's branch proves a package/app/offline-Ollama direction is viable, though it does not include all ML experimentation features from `unify-detector`.
+- Runtime alert handling verifies a short candidate queue instead of only the highest-priority/top candidate.
+- Always-on critical baseline rules exist and can be merged into detector runs.
+- Compound threat recipes exist for first-pass armed robbery and violent theft.
+- Per-rule evidence-frame selection exists for the Verification Gate.
+- First-pass situational candidate generators now exist for running/panic, person down/fall, camera tampering/obstruction, fire/smoke, masked entry checks, counter/restricted-zone rush, tailgating, abandoned object, perimeter intrusion, and crowd formation.
 
 ## What Is Missing
 
 ### Backend Intelligence Gaps
 
-- The backend is still too narrow in practice. It mostly evaluates weapons, violence, theft, zones, and concealment.
-- Robbery is not a first-class compound event. It may only be caught if weapon, violence, or panic-like signals fire.
+- The backend has broader candidate coverage now, but several new signals are heuristic and not yet empirically validated.
+- Robbery has a first compound recipe and can now consume running, masked entry, counter rush, and person down signals, but the reliability of those contributing signals still needs clip-level evaluation.
 - The system does not yet implement the GTM 12-rule V1 set end to end.
-- There is no always-on critical safety baseline for events like visible weapons, person down, fire/smoke, and camera tampering independent of customer-specific rules.
-- Multiple simultaneous alerts are not handled properly. The runtime often chooses only the highest-priority/top candidate.
-- The Verification Gate in `detector.py` still receives the current frame, not a curated rolling event clip.
-- Per-rule gate configuration is not implemented in runtime. Experiments show motion threats and object threats need different frame counts/settings.
+- Always-on critical baseline exists for weapon/violence plus first-pass person down, fire/smoke, and camera tampering candidate signals.
+- The Verification Gate can now receive the VideoMAE-sampled event window when VideoMAE runs around a detector-triggered moment.
+- Per-rule gate frame selection is implemented. It still needs empirical tuning per environment/rule.
 - Weapon/gun detection is weak on low-resolution CCTV, small objects, blur, and occlusion.
 - Current classifier is frame-based and cannot truly understand temporal action.
 
@@ -198,21 +202,23 @@ Currently, only parts of this are present:
 
 - Loitering: partially via zones/dwell
 - After-hours presence: partially via zone/time configs
-- Running: primitive motion possible, not productized
+- Running: first-pass tracked-person speed candidate exists
+- Perimeter intrusion/fence climbing: first-pass perimeter-zone entry candidate exists; fence-climbing pose logic is not yet separate
+- Crowd formation: first-pass close-person-cluster candidate exists
+- Tailgating: first-pass multi-person entry-zone timing candidate exists
+- Abandoned object: first-pass unattended bag/package persistence candidate exists
+- Camera tampering/obstruction: first-pass frame-quality candidate exists
+- Person down/fall: first-pass horizontal-body candidate exists
+- Mask/face-covering during business hours: first-pass entry-zone VLM-check candidate exists, but no local mask detector yet
 - Weapon/violence: present but brittle
 - Concealment/shoplifting: present as retail-specific candidate generator
 
 Not yet productized:
 
-- perimeter intrusion/fence climbing
-- crowd formation
-- tailgating
-- abandoned object
 - unauthorized vehicle/wrong-way movement
-- camera tampering/obstruction
-- person down/fall
-- mask/face-covering during business hours
 - power-outage + motion combo
+- reliable mask recognition without VLM verification
+- dedicated fence-climbing recognition beyond perimeter-zone presence
 
 ### Evaluation Gaps
 
@@ -347,7 +353,7 @@ Goal: customer-specific rules should not hide universal critical threats.
 Tasks:
 
 - Create `configs/baseline_critical_v1.json`.
-- Include weapon/armed robbery, violence/assault, person down/fall, camera tampering, fire/smoke once implemented.
+- Include weapon/armed robbery, violence/assault, person down/fall, camera tampering, and fire/smoke.
 - Merge baseline rules with customer config at runtime.
 - Allow customer severity tuning later, but do not allow disabling critical safety rules in early pilots without an explicit operator override.
 
@@ -477,10 +483,10 @@ Manual smoke command:
 ```bash
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MPLCONFIGDIR=/private/tmp ./.venv/bin/python detector.py \
   --source data/test_clips/violence_suspected.mp4 \
-  --config configs/hybrid_video_action_v1.json \
+  --config configs/full_hybrid_v1.json \
   --video-action-backend videomae \
   --video-action-window-seconds 2 \
-  --video-action-cooldown 0 \
+  --video-action-cooldown 2 \
   --max-frames 7 \
   --gate-provider mock \
   --no-track \

@@ -1,0 +1,26 @@
+{
+  "_comment": "Integrated V1 test config: base detector rules plus weak VideoMAE temporal witness rules. Video action signals are medium-priority support and must still pass the VLM gate.",
+  "use_case_id": "full_hybrid_v1",
+  "rules": [
+    {"name": "weapon_sighting", "trigger": {"detector": "weapons"}, "priority": "critical"},
+    {"name": "violence", "trigger": {"detector": "violence"}, "priority": "critical"},
+    {"name": "theft_depart", "trigger": {"detector": "theft", "state": "DEPART"}, "priority": "high"},
+    {"name": "shoplifting", "trigger": {"detector": "concealment"}, "priority": "high"},
+    {"name": "perimeter_intrusion", "trigger": {"detector": "perimeter_intrusion"}, "priority": "high"},
+    {"name": "tailgating", "trigger": {"detector": "tailgating"}, "priority": "high"},
+    {"name": "abandoned_object", "trigger": {"detector": "abandoned_object"}, "priority": "high"},
+    {"name": "crowd_formation", "trigger": {"detector": "crowd_formation"}, "priority": "medium"},
+    {
+      "name": "video_action_violence_candidate",
+      "trigger": {"detector": "video_action"},
+      "context_filter": "signal_type == 'violence_candidate' and adjusted_confidence >= 0.02",
+      "priority": "medium"
+    },
+    {
+      "name": "video_action_weapon_handling_candidate",
+      "trigger": {"detector": "video_action"},
+      "context_filter": "signal_type == 'weapon_handling_candidate' and adjusted_confidence >= 0.02",
+      "priority": "medium"
+    }
+  ]
+}

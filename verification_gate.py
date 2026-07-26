@@ -76,7 +76,8 @@ Respond with a single JSON object only. No markdown. No text before or after the
 }}
 
 Rules:
-- Only confirm if the visual evidence clearly supports the alert.
+- Only confirm if the visual evidence clearly supports this exact alert category and rule.
+- Do not confirm a violence alert because theft is visible, or a theft alert because rough movement is visible.
 - If the scene looks normal or the alert is ambiguous, return confirmed: false.
 - confidence should reflect how certain you are, not how alarming the scene is.
 """
@@ -108,12 +109,15 @@ Then on the FINAL line, output ONLY this JSON object (no markdown, nothing after
 {{"confirmed": true or false, "confidence": 0.0 to 1.0, "reason": "one sentence", "alert_priority": "{priority}"}}
 
 Be strict: confirm only if the visual evidence clearly supports the alert. If ambiguous or normal, confirmed must be false. Confidence reflects certainty, not how alarming the scene is.
+Do not confirm a violence alert because theft is visible, or a theft alert because rough movement is visible.
 """
 
 _QUESTIONS: dict[str, str] = {
     "shoplifting": "Does this frame show a person concealing or taking merchandise without paying in a {environment_type}?",
+    "violence": "Does this frame show genuine physical violence or assault in a {environment_type}?",
     "violence_in_store": "Does this frame show genuine physical violence or assault in a {environment_type}?",
     "weapon_sighting": "Does this frame show a real weapon being carried or brandished by a person?",
+    "theft_depart": "Does this frame show a person leaving or attempting to leave with merchandise without paying in a {environment_type}?",
     "after_hours_intrusion": "Does this frame show unauthorized presence in a {environment_type} outside business hours?",
     "loitering_near_merchandise": "Does this frame show a person behaving suspiciously near merchandise in a {environment_type}?",
     "armed_robbery": "Does this frame show an armed robbery in progress?",
@@ -121,6 +125,18 @@ _QUESTIONS: dict[str, str] = {
     "theft_attempt": "Does this frame show a person attempting to steal something?",
     "card_skimming_suspect": "Does this frame show suspicious behavior at an ATM or card reader?",
     "after_hours_presence": "Does this frame show unauthorized presence during closed hours?",
+    "perimeter_intrusion": "Does this frame show a person entering, crossing, climbing, or lingering in a perimeter/fence/restricted boundary area in a {environment_type}?",
+    "tailgating": "Across these frames, do two or more people appear to enter through the same gate/door closely together in a way that could bypass normal access control?",
+    "abandoned_object": "Does this frame show an unattended bag, package, box, or suitcase left behind with no nearby owner in a {environment_type}?",
+    "crowd_formation": "Does this frame show an unusual crowd or tight group forming in a way that appears relevant to security in a {environment_type}?",
+    "video_action_violence_candidate": (
+        "The video model is only weak temporal evidence. Across these frames, is there clear visual evidence of "
+        "physical violence or assault in a {environment_type}?"
+    ),
+    "video_action_weapon_handling_candidate": (
+        "The video model is only weak temporal evidence. Across these frames, is there clear visual evidence of "
+        "a weapon being handled, carried, or brandished in a {environment_type}?"
+    ),
 }
 
 
@@ -130,6 +146,13 @@ def _build_question(rule_name: str, environment_type: str) -> str:
         "Does this frame confirm a security threat event in a {environment_type}?",
     )
     return template.format(environment_type=environment_type)
+
+
+def _question_for_alert(alert: CandidateAlert, environment_type: str) -> str:
+    custom = getattr(alert, "question", None)
+    if custom:
+        return str(custom)
+    return _build_question(alert.rule_name, environment_type)
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +205,7 @@ class VerificationGate:
             title=alert.title,
             person_id=alert.person_id if alert.person_id is not None else "unknown",
             object_label=alert.object_label or "unknown",
-            question=_build_question(alert.rule_name, environment_type),
+            question=_question_for_alert(alert, environment_type),
             priority=alert.priority,
         )
 
@@ -200,7 +223,7 @@ class VerificationGate:
         else:
             raise RuntimeError(f"Unsupported provider: {self.provider}")
 
-        result = _parse_response(raw_response, alert.priority)
+        result = _apply_rule_consistency_guard(alert, _parse_response(raw_response, alert.priority))
 
         if self.save_dir:
             _save_artifacts(self.save_dir, self._call_count, frames, alert, result, raw_response)
@@ -348,6 +371,65 @@ def _parse_response(raw: str, fallback_priority: str) -> VerificationResult:
             timestamp=timestamp,
             raw_response=raw,
         )
+
+
+def _apply_rule_consistency_guard(alert: CandidateAlert, result: VerificationResult) -> VerificationResult:
+    if not result.confirmed:
+        return result
+
+    rule = alert.rule_name.lower()
+    reason = result.reason.lower()
+    title = alert.title.lower()
+
+    if "violence" in rule or "violence" in title or "assault" in rule:
+        physical_violence_terms = (
+            "assault",
+            "attack",
+            "attacked",
+            "fight",
+            "fighting",
+            "hit",
+            "hitting",
+            "punch",
+            "kick",
+            "stab",
+            "stabbing",
+            "knife",
+            "weapon",
+            "gun",
+            "physical",
+            "grabbing",
+            "striking",
+            "forcefully",
+            "pushed",
+            "pushing",
+            "wrestling",
+        )
+        theft_only_terms = (
+            "theft",
+            "steal",
+            "stealing",
+            "shoplifting",
+            "taking merchandise",
+            "merchandise from",
+            "conceal",
+            "concealing",
+            "shelf",
+            "shelves",
+        )
+        has_physical_violence = any(term in reason for term in physical_violence_terms)
+        has_theft_only = any(term in reason for term in theft_only_terms)
+        if has_theft_only and not has_physical_violence:
+            return VerificationResult(
+                confirmed=False,
+                confidence=min(result.confidence, 0.2),
+                reason=f"category mismatch: VLM described theft/shoplifting evidence, not violence. Original reason: {result.reason}",
+                alert_priority=result.alert_priority,
+                timestamp=result.timestamp,
+                raw_response=result.raw_response,
+            )
+
+    return result
 
 
 # ---------------------------------------------------------------------------

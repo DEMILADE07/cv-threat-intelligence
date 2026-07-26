@@ -109,6 +109,8 @@ def parse_anchors(raw: Iterable[str] | None) -> tuple[sv.Position, ...]:
     anchors: list[sv.Position] = []
     for name in raw:
         key = str(name).strip().upper()
+        if key in ("ALL", "ANY", "*"):
+            return tuple(p for p in sv.Position if p != sv.Position.CENTER_OF_MASS)
         if key not in _ANCHOR_BY_NAME:
             raise ValueError(
                 f"Unknown zone anchor '{name}'. Allowed: {sorted(_ANCHOR_BY_NAME)}"
@@ -152,8 +154,8 @@ class RetailZoneMonitor:
     def __init__(self, zones: list[ZoneSpec], dwell_grace_seconds: float = 0.0) -> None:
         self.zones = zones
         self.dwell_grace_seconds = dwell_grace_seconds
-        self._sv_zones: dict[str, sv.PolygonZone] = {
-            z.name: sv.PolygonZone(polygon=z.polygon, triggering_anchors=z.anchors)
+        self._sv_zones: dict[str, list[sv.PolygonZone]] = {
+            z.name: [sv.PolygonZone(polygon=z.polygon, triggering_anchors=(a,)) for a in z.anchors]
             for z in zones
         }
         self._spec_by_name: dict[str, ZoneSpec] = {z.name: z for z in zones}
@@ -165,8 +167,16 @@ class RetailZoneMonitor:
 
     def update(self, detections: sv.Detections, timestamp: float) -> list[PersonZoneState]:
         n = len(detections)
-        # Boolean membership mask per zone, aligned to detection order.
-        masks = {name: zone.trigger(detections) for name, zone in self._sv_zones.items()}
+        # Boolean membership mask per zone (logical OR across configured anchors)
+        masks = {}
+        for z in self.zones:
+            if n == 0:
+                masks[z.name] = np.array([], dtype=bool)
+            else:
+                m = np.zeros(n, dtype=bool)
+                for pz in self._sv_zones[z.name]:
+                    m = np.logical_or(m, pz.trigger(detections))
+                masks[z.name] = m
 
         current_keys: set[tuple[int, str]] = set()
         states: list[PersonZoneState] = []
@@ -216,9 +226,9 @@ class RetailZoneMonitor:
     ) -> np.ndarray:
         """Draw zones, tracked boxes, and per-person id/zone/dwell labels."""
         out = frame
-        for name, zone in self._sv_zones.items():
+        for name, zone_list in self._sv_zones.items():
             color = sv.Color.RED if self._spec_by_name[name].kind == "shelf" else sv.Color.BLUE
-            annot = sv.PolygonZoneAnnotator(zone=zone, color=color, thickness=2)
+            annot = sv.PolygonZoneAnnotator(zone=zone_list[0], color=color, thickness=2)
             out = annot.annotate(scene=out)
         out = sv.BoxAnnotator().annotate(scene=out, detections=detections)
         labels = [s.label() for s in states]

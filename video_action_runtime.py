@@ -26,7 +26,8 @@ from video_action_model import (
 @dataclass(frozen=True)
 class BufferedFrame:
     index: int
-    frame: np.ndarray
+    frame_bgr: np.ndarray
+    frame_rgb: np.ndarray
 
 
 class VideoActionRuntime:
@@ -55,17 +56,28 @@ class VideoActionRuntime:
         self.cooldown_seconds = cooldown_seconds
         self.verbose = verbose
         self._last_analysis_timestamp = -1_000_000.0
+        self._effective_cooldown_seconds = cooldown_seconds if cooldown_seconds > 0 else window_seconds
+        self._last_sampled_frame_indices: list[int] = []
+        self._last_gate_frames: list[np.ndarray] = []
         buffer_size = max(frame_count, int(round(self.fps * window_seconds * 2)) + frame_count)
         self._frames: deque[BufferedFrame] = deque(maxlen=buffer_size)
 
     def add_frame(self, frame: np.ndarray, *, frame_index: int) -> None:
-        # Store RGB frames because VideoMAE/X3D wrappers expect RGB arrays.
-        self._frames.append(BufferedFrame(index=frame_index, frame=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        # VideoMAE/X3D need RGB, while OpenCV/VLM artifact encoding expects BGR.
+        self._frames.append(
+            BufferedFrame(
+                index=frame_index,
+                frame_bgr=frame.copy(),
+                frame_rgb=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+            )
+        )
 
     def analyze_event(self, *, center_frame_index: int, timestamp: float) -> list[RawEvent]:
-        if timestamp - self._last_analysis_timestamp < self.cooldown_seconds:
+        if timestamp - self._last_analysis_timestamp < self._effective_cooldown_seconds:
+            self._clear_last_gate_window()
             return []
         if not self._frames:
+            self._clear_last_gate_window()
             return []
 
         window = self._build_buffered_window(center_frame_index)
@@ -88,6 +100,21 @@ class VideoActionRuntime:
             timestamp=timestamp,
         )
 
+    @property
+    def last_sampled_frame_indices(self) -> list[int]:
+        return list(self._last_sampled_frame_indices)
+
+    def last_gate_frames(self, *, max_count: int | None = None) -> list[np.ndarray]:
+        frames = self._last_gate_frames
+        if max_count is not None and max_count > 0 and len(frames) > max_count:
+            sampled = sample_evenly_with_indices(frames, count=max_count)
+            frames = [item.frame for item in sampled]
+        return [frame.copy() for frame in frames]
+
+    def _clear_last_gate_window(self) -> None:
+        self._last_sampled_frame_indices = []
+        self._last_gate_frames = []
+
     def _build_buffered_window(self, center_frame_index: int) -> FrameWindow:
         radius = max(0, int(round((self.window_seconds * self.fps) / 2)))
         start = center_frame_index - radius
@@ -97,11 +124,13 @@ class VideoActionRuntime:
         if not candidates:
             candidates = list(self._frames)
 
-        sampled_local = sample_evenly_with_indices([item.frame for item in candidates], count=self.frame_count)
+        sampled_local = sample_evenly_with_indices([item.frame_rgb for item in candidates], count=self.frame_count)
         sampled = [
             SampledFrame(index=candidates[item.index].index, frame=item.frame)
             for item in sampled_local
         ]
+        self._last_sampled_frame_indices = [item.index for item in sampled]
+        self._last_gate_frames = [candidates[item.index].frame_bgr.copy() for item in sampled_local]
         return FrameWindow(
             name="event",
             start_index=candidates[0].index,

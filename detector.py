@@ -12,13 +12,28 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from alert_queue import should_log_rejection, verify_alert_queue
 from customization import (
     CustomizationEngine,
     assessments_to_events,
     concealment_to_events,
     zone_states_to_events,
 )
-from verification_gate import VerificationGate
+from frame_select import frames_for_rule, select_evidence_frames
+from situational_detectors import (
+    AbandonedObjectDetector,
+    CameraTamperDetector,
+    CounterRushDetector,
+    CrowdFormationDetector,
+    FireSmokeDetector,
+    MaskedEntryCandidateDetector,
+    PerimeterIntrusionDetector,
+    PersonDownDetector,
+    RunningPanicDetector,
+    TailgatingDetector,
+    situational_to_events,
+)
+from verification_gate import VerificationGate, VerificationResult
 from video_action_runtime import build_video_action_runtime
 
 import cv2
@@ -273,6 +288,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional limit for debugging. 0 means unlimited.",
     )
     parser.add_argument(
+        "--max-events",
+        type=int,
+        default=0,
+        help="Optional limit for saved threat events in this run. 0 means unlimited.",
+    )
+    parser.add_argument(
         "--assault-distance-ratio",
         type=float,
         default=1.2,
@@ -414,6 +435,28 @@ def parse_args() -> argparse.Namespace:
         help="Path to user_config.json (Customization Engine rules). Example: configs/retail_v1.json",
     )
     parser.add_argument(
+        "--baseline-config",
+        type=str,
+        default="configs/baseline_critical_v1.json",
+        help="Always-on critical baseline rules merged with --config.",
+    )
+    parser.add_argument(
+        "--no-baseline",
+        action="store_true",
+        help="Disable always-on critical baseline rules for controlled experiments.",
+    )
+    parser.add_argument(
+        "--compound-config",
+        type=str,
+        default="configs/compound_recipes_v1.json",
+        help="Compound threat recipe rules merged with --config.",
+    )
+    parser.add_argument(
+        "--no-compound",
+        action="store_true",
+        help="Disable compound recipe rules for controlled experiments.",
+    )
+    parser.add_argument(
         "--zones",
         type=str,
         default="",
@@ -424,6 +467,11 @@ def parse_args() -> argparse.Namespace:
         "--concealment",
         action="store_true",
         help="Enable the pose-based concealment (action) detector -> 'concealment' events. Needs --pose-weights.",
+    )
+    parser.add_argument(
+        "--no-situational",
+        action="store_true",
+        help="Disable lightweight situational candidates: running, person-down, camera-tamper, fire/smoke, masked-entry, counter-rush, tailgating, abandoned-object, perimeter-intrusion, crowd-formation.",
     )
     parser.add_argument(
         "--classifier-weights",
@@ -485,11 +533,16 @@ def parse_args() -> argparse.Namespace:
         help="Force video action device: cpu, mps, or cuda. X3D defaults to cpu on Mac.",
     )
     parser.add_argument(
+        "--video-action-verbose",
+        action="store_true",
+        help="Print each VideoMAE/X3D event-window prediction. Off by default to keep integrated runs readable.",
+    )
+    parser.add_argument(
         "--gate-provider",
         default="mock",
-        choices=("mock", "anthropic", "openrouter"),
+        choices=("mock", "anthropic", "openrouter", "ollama"),
         help="VLM provider for the Verification Gate. 'mock' confirms all for testing; 'anthropic' = Claude Vision; "
-             "'openrouter' = Gemma 4 / other vision models via OpenRouter.",
+             "'openrouter' = hosted vision models; 'ollama' = local/offline Ollama vision model.",
     )
     parser.add_argument(
         "--gate-model",
@@ -500,6 +553,35 @@ def parse_args() -> argparse.Namespace:
         "--gate-api-key-env",
         default="ANTHROPIC_API_KEY",
         help="Env var holding the gate API key (auto-switches to OPENROUTER_API_KEY for --gate-provider openrouter).",
+    )
+    parser.add_argument(
+        "--gate-candidate-limit",
+        type=int,
+        default=3,
+        help="Maximum matching candidate alerts to verify per event moment before giving up.",
+    )
+    parser.add_argument(
+        "--gate-repeat-seconds",
+        type=float,
+        default=2.0,
+        help="Minimum seconds before re-verifying the same rule/title candidate.",
+    )
+    parser.add_argument(
+        "--gate-max-frames",
+        type=int,
+        default=4,
+        help="Maximum event frames sent to the VLM gate. VideoMAE may still use more frames internally.",
+    )
+    parser.add_argument(
+        "--gate-log-rejections",
+        action="store_true",
+        help="Print every rejected gate candidate. Confirmed alerts and gate errors are always printed.",
+    )
+    parser.add_argument(
+        "--gate-rejection-log-limit",
+        type=int,
+        default=3,
+        help="How many rejected gate candidates to print when --gate-log-rejections is off.",
     )
     return parser.parse_args()
 
@@ -1752,6 +1834,7 @@ def main() -> None:
     )
 
     last_event_time = 0.0
+    saved_event_count = 0
     frame_count = 0
     time_anchor = time.time()
     threat_visible_last_frame = False
@@ -1772,8 +1855,15 @@ def main() -> None:
         approach_ratio=args.theft_approach_ratio,
         debug=args.debug_theft,
     )
-    customization_engine = CustomizationEngine(args.config)
-    last_alert_rule: str | None = None
+    customization_engine = CustomizationEngine(
+        args.config,
+        baseline_path=None if args.no_baseline else args.baseline_config,
+    )
+    if not args.no_compound and args.compound_config:
+        customization_engine.load_additional(args.compound_config)
+    last_gate_attempts: dict[str, float] = {}
+    rejected_gate_log_count = 0
+    gate_frame_buffer: deque = deque(maxlen=120)
     video_action_runtime = None
     if args.video_action_backend != "none":
         fps_for_video_action = fps_from_capture if fps_from_capture and fps_from_capture > 0 else 30.0
@@ -1786,7 +1876,7 @@ def main() -> None:
             top_k=args.video_action_top_k,
             cooldown_seconds=args.video_action_cooldown,
             device=args.video_action_device,
-            verbose=True,
+            verbose=args.video_action_verbose,
         )
         print(
             f"[VideoAction] {args.video_action_backend} ON — "
@@ -1807,6 +1897,22 @@ def main() -> None:
     if (zone_monitor is not None or concealment_detector is not None) and pose_model is None:
         print("[Warning] --zones/--concealment need a pose model; pass --pose-weights yolov8n-pose.pt")
 
+    situational_enabled = not args.no_situational
+    running_detector = RunningPanicDetector() if situational_enabled else None
+    person_down_detector = PersonDownDetector() if situational_enabled else None
+    camera_tamper_detector = CameraTamperDetector() if situational_enabled else None
+    fire_smoke_detector = FireSmokeDetector() if situational_enabled else None
+    abandoned_object_detector = AbandonedObjectDetector() if situational_enabled else None
+    crowd_formation_detector = CrowdFormationDetector() if situational_enabled else None
+    counter_rush_detector = CounterRushDetector() if situational_enabled else None
+    masked_entry_detector = MaskedEntryCandidateDetector() if situational_enabled else None
+    tailgating_detector = TailgatingDetector() if situational_enabled else None
+    perimeter_intrusion_detector = PerimeterIntrusionDetector() if situational_enabled else None
+    if situational_enabled:
+        print("[Situational] Lightweight candidates ON: running, person_down, camera_tampering, fire/smoke, abandoned_object, crowd_formation, masked_entry, counter_rush, tailgating, perimeter_intrusion")
+    else:
+        print("[Situational] Lightweight candidates OFF")
+
     scene_context: dict | None = None
     if args.context_file:
         context_path = Path(args.context_file)
@@ -1825,7 +1931,7 @@ def main() -> None:
     if args.gate_provider != "mock":
         print(f"[VerificationGate] Provider: {args.gate_provider} ({verification_gate.model}) — alerts confirmed by VLM before recording.")
     else:
-        print("[VerificationGate] Provider: mock (all alerts auto-confirmed). Use --gate-provider openrouter/anthropic for real verification.)")
+        print("[VerificationGate] Provider: mock (all alerts auto-confirmed). Use --gate-provider openrouter/anthropic/ollama for real verification.)")
 
     print("Starting inference loop. Press 'q' to quit.")
     try:
@@ -1835,6 +1941,7 @@ def main() -> None:
                 print("Stream ended or frame could not be read.")
                 break
             current_frame_index = frame_count
+            gate_frame_buffer.append(frame.copy())
             if video_action_runtime is not None:
                 video_action_runtime.add_frame(frame, frame_index=current_frame_index)
 
@@ -1967,12 +2074,16 @@ def main() -> None:
 
             # Customization Engine + Verification Gate
             if args.config:
+                # When policy + gate are active, only a confirmed gate result should escalate.
+                # Raw detector assessments remain candidate generators, not final alerts.
+                threat_detected = False
                 ts_now = time.time() - time_anchor
                 raw_events = assessments_to_events(
                     object_assessment, violence_assessment, theft_assessment,
                     timestamp=ts_now,
                     theft_detector=theft_detector,
                 )
+                gate_frames_for_current_alert = None
                 should_run_video_action = (
                     video_action_runtime is not None
                     and (
@@ -1981,11 +2092,59 @@ def main() -> None:
                         or theft_assessment.active
                     )
                 )
+                situational_assessments = []
+                if situational_enabled:
+                    detected_people_for_situational = (
+                        pose_people
+                        if pose_people
+                        else [
+                            detection for detection in detections
+                            if normalize_label(detection.label) in person_classes
+                        ]
+                    )
+                    if camera_tamper_detector is not None:
+                        situational_assessments += camera_tamper_detector.update(frame, ts_now)
+                    if fire_smoke_detector is not None:
+                        situational_assessments += fire_smoke_detector.update(frame, ts_now)
+                    if running_detector is not None:
+                        situational_assessments += running_detector.update(pose_people, ts_now, frame.shape)
+                    if person_down_detector is not None:
+                        situational_assessments += person_down_detector.update(pose_people, ts_now, frame.shape)
+                    if abandoned_object_detector is not None:
+                        situational_assessments += abandoned_object_detector.update(
+                            detections,
+                            people=detected_people_for_situational,
+                            timestamp=ts_now,
+                            frame_shape=frame.shape,
+                        )
+                    if crowd_formation_detector is not None:
+                        situational_assessments += crowd_formation_detector.update(
+                            detected_people_for_situational,
+                            timestamp=ts_now,
+                            frame_shape=frame.shape,
+                        )
+                raw_events += situational_to_events(situational_assessments)
+                should_run_video_action = should_run_video_action or any(a.active for a in situational_assessments)
                 # Retail action layer events (zones + concealment) ride the same pose pass
                 # and merge into the same event stream the user's rules evaluate.
+                zone_states = []
                 if zone_monitor is not None:
                     zone_states = zone_monitor.update(pose_people_to_sv_detections(pose_people), ts_now)
                     raw_events += zone_states_to_events(zone_states, ts_now)
+                    zone_situational_assessments = []
+                    if counter_rush_detector is not None:
+                        zone_situational_assessments += counter_rush_detector.update(zone_states, ts_now)
+                    if masked_entry_detector is not None:
+                        zone_situational_assessments += masked_entry_detector.update(zone_states, ts_now)
+                    if tailgating_detector is not None:
+                        zone_situational_assessments += tailgating_detector.update(zone_states, ts_now)
+                    if perimeter_intrusion_detector is not None:
+                        zone_situational_assessments += perimeter_intrusion_detector.update(zone_states, ts_now)
+                    raw_events += situational_to_events(zone_situational_assessments)
+                    should_run_video_action = (
+                        should_run_video_action
+                        or any(a.active for a in zone_situational_assessments)
+                    )
                 if concealment_detector is not None:
                     bag_bboxes = [d.bbox for d in detections
                                   if normalize_label(d.label) in CONCEALMENT_BAG_CLASSES]
@@ -1999,39 +2158,76 @@ def main() -> None:
                     should_run_video_action = should_run_video_action or any(event.active for event in concealment_events)
                 if should_run_video_action and video_action_runtime is not None:
                     try:
-                        raw_events += video_action_runtime.analyze_event(
+                        video_action_events = video_action_runtime.analyze_event(
                             center_frame_index=current_frame_index,
                             timestamp=ts_now,
                         )
+                        if video_action_runtime.last_gate_frames():
+                            gate_frames_for_current_alert = video_action_runtime.last_gate_frames(
+                                max_count=args.gate_max_frames,
+                            )
+                        raw_events += video_action_events
                     except Exception as exc:  # noqa: BLE001 - optional weak signal must not kill detector
                         print(f"[VideoAction error] {str(exc)[:140]}")
                 candidate_alerts = customization_engine.evaluate(raw_events, scene_context=scene_context)
-                top_alert = candidate_alerts[0] if candidate_alerts else None
-                if top_alert is not None:
-                    rule_sig = f"{top_alert.rule_name}:{top_alert.title}"
-                    if rule_sig != last_alert_rule:
+                if candidate_alerts:
+                    def verify_candidate(alert):
+                        if gate_frames_for_current_alert and alert.detector == "video_action":
+                            gate_input = gate_frames_for_current_alert
+                        else:
+                            selected_frames, _selection_meta = select_evidence_frames(
+                                list(gate_frame_buffer),
+                                alert.rule_name,
+                                count=min(frames_for_rule(alert.rule_name), max(1, args.gate_max_frames)),
+                            )
+                            gate_input = selected_frames or [frame]
                         try:
-                            gate_result = verification_gate.verify(frame, top_alert, scene_context)
+                            return verification_gate.verify(gate_input, alert, scene_context)
                         except Exception as exc:  # noqa: BLE001 - a transient gate/API error must not kill the run
-                            print(f"[gate error] {top_alert.rule_name} — {str(exc)[:140]} (alert held, not raised)")
-                            gate_result = None
-                        if gate_result is not None and gate_result.confirmed:
-                            print(
-                                f"[CONFIRMED] {top_alert.rule_name} ({top_alert.priority.upper()}) "
-                                f"— {top_alert.title}"
-                                + (f" [obj: {top_alert.object_label}]" if top_alert.object_label else "")
-                                + f" | confidence={gate_result.confidence:.2f} | {gate_result.reason}"
+                            msg = str(exc)[:140]
+                            print(f"[gate error] {alert.rule_name} — {msg} (candidate held, trying next if available)")
+                            return VerificationResult(
+                                confirmed=False,
+                                confidence=0.0,
+                                reason=f"gate error: {msg}",
+                                alert_priority=alert.priority,
+                                timestamp=datetime.utcnow().isoformat() + "Z",
                             )
-                            threat_detected = True
-                        elif gate_result is not None:
+
+                    confirmed_alert, gate_result, gate_attempts = verify_alert_queue(
+                        candidate_alerts,
+                        verify=verify_candidate,
+                        last_attempts=last_gate_attempts,
+                        now=ts_now,
+                        candidate_limit=args.gate_candidate_limit,
+                        repeat_seconds=args.gate_repeat_seconds,
+                    )
+
+                    for attempt in gate_attempts:
+                        alert = attempt.alert
+                        result = attempt.result
+                        if result.confirmed:
                             print(
-                                f"[REJECTED]  {top_alert.rule_name} — {gate_result.reason}"
+                                f"[CONFIRMED] {alert.rule_name} ({alert.priority.upper()}) "
+                                f"— {alert.title}"
+                                + (f" [obj: {alert.object_label}]" if alert.object_label else "")
+                                + f" | confidence={result.confidence:.2f} | {result.reason}"
                             )
-                            threat_detected = False
-                        last_alert_rule = rule_sig
-                else:
-                    if last_alert_rule is not None:
-                        last_alert_rule = None
+                        else:
+                            if should_log_rejection(
+                                rejected_gate_log_count,
+                                limit=args.gate_rejection_log_limit,
+                                force=args.gate_log_rejections,
+                            ):
+                                print(
+                                    f"[REJECTED]  {alert.rule_name} — {result.reason}"
+                                )
+                            rejected_gate_log_count += 1
+
+                    if confirmed_alert is not None and gate_result is not None:
+                        threat_detected = True
+                    elif gate_attempts:
+                        threat_detected = False
 
             weapon_detections_for_debug = validated_weapon_detections
             if args.debug_weapon:
@@ -2090,8 +2286,12 @@ def main() -> None:
                     source=source_name,
                     fps=fps_from_capture,
                 )
+                saved_event_count += 1
                 last_event_time = time.time()
                 print(f"Threat event saved to: {event_dir}")
+                if args.max_events > 0 and saved_event_count >= args.max_events:
+                    print(f"Reached --max-events={args.max_events}; stopping.")
+                    break
             threat_visible_last_frame = threat_detected
 
             recorder.write(annotated)

@@ -36,6 +36,7 @@ class CandidateAlert:
     object_label: str | None
     timestamp: float
     reasons: list[str] = field(default_factory=list)
+    question: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -47,6 +48,7 @@ class CandidateAlert:
             "object_label": self.object_label,
             "timestamp": self.timestamp,
             "reasons": self.reasons,
+            "question": self.question,
         }
 
 
@@ -56,9 +58,16 @@ PRIORITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": 0}
 class CustomizationEngine:
     """Evaluates a list of RawEvents against user-defined rules and returns CandidateAlerts."""
 
-    def __init__(self, config_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        config_path: str | Path | None = None,
+        baseline_path: str | Path | None = None,
+    ) -> None:
         self.rules: list[dict] = []
+        self.baseline_rules: list[dict] = []
         self.use_case_id: str = "default"
+        if baseline_path:
+            self.load_baseline(baseline_path)
         if config_path:
             self.load(config_path)
 
@@ -72,6 +81,25 @@ class CustomizationEngine:
         self.rules = data.get("rules", [])
         print(f"[CustomizationEngine] Loaded {len(self.rules)} rules for use-case '{self.use_case_id}'")
 
+    def load_baseline(self, baseline_path: str | Path) -> None:
+        path = Path(baseline_path)
+        if not path.exists():
+            print(f"[CustomizationEngine] Baseline config not found: {path}")
+            return
+        data = json.loads(path.read_text())
+        self.baseline_rules = data.get("rules", [])
+        print(f"[CustomizationEngine] Loaded {len(self.baseline_rules)} always-on baseline rule(s)")
+
+    def load_additional(self, config_path: str | Path) -> None:
+        path = Path(config_path)
+        if not path.exists():
+            print(f"[CustomizationEngine] Additional config not found: {path}")
+            return
+        data = json.loads(path.read_text())
+        extra_rules = data.get("rules", [])
+        self.rules.extend(extra_rules)
+        print(f"[CustomizationEngine] Loaded {len(extra_rules)} additional rule(s) from {path}")
+
     def evaluate(
         self,
         events: list[RawEvent],
@@ -83,7 +111,12 @@ class CustomizationEngine:
         context = scene_context or {}
         alerts: list[CandidateAlert] = []
 
-        for rule in self.rules:
+        for rule in self.baseline_rules + self.rules:
+            if "signals" in rule:
+                compound = _eval_compound(rule, events, now)
+                if compound is not None:
+                    alerts.append(compound)
+                continue
             trigger = rule.get("trigger", {})
             for event in events:
                 if not event.active:
@@ -201,6 +234,108 @@ def _match_context_filter(
         return bool(eval(expr, {"__builtins__": {}}, ns))  # noqa: S307
     except Exception:
         return True  # don't block alert if expression is malformed
+
+
+# ---------------------------------------------------------------------------
+# Compound threat recipes
+# ---------------------------------------------------------------------------
+
+_SIGNAL_ALIASES = {
+    "weapon_candidate": "weapons",
+    "weapon": "weapons",
+    "gun": "weapons",
+    "knife": "weapons",
+    "violence": "violence",
+    "assault": "violence",
+    "fight": "violence",
+    "person_down": "person_down",
+    "fall": "person_down",
+    "concealment": "concealment",
+    "theft": "theft",
+    "running": "running",
+    "panic": "running",
+    "masked_entry": "masked_entry",
+    "counter_rush": "counter_rush",
+    "tailgating": "tailgating",
+    "abandoned_object": "abandoned_object",
+    "perimeter_intrusion": "perimeter_intrusion",
+    "fence_climbing": "perimeter_intrusion",
+    "crowd": "crowd_formation",
+    "crowd_formation": "crowd_formation",
+    "video_action": "video_action",
+}
+
+
+def _match_signal(event: RawEvent, spec: Any) -> bool:
+    if isinstance(spec, dict):
+        return _match_trigger(event, spec)
+    target = _SIGNAL_ALIASES.get(str(spec), str(spec))
+    signal_type = str(event.extra.get("signal_type") or "")
+    return (
+        event.detector == target
+        or event.detector == spec
+        or str(spec) in signal_type
+        or target in signal_type
+    )
+
+
+def _logic_satisfied(logic: str, severities: list[int], total_signals: int) -> bool:
+    count = len(severities)
+    normalized = (logic or "any").lower()
+    if normalized == "all":
+        return total_signals > 0 and count >= total_signals
+    if normalized == "any":
+        return count >= 1
+    if normalized.startswith("at_least_"):
+        try:
+            return count >= int(normalized.rsplit("_", 1)[1])
+        except ValueError:
+            return count >= 1
+    if normalized == "one_high_or_two_medium":
+        highs = sum(1 for severity in severities if severity >= PRIORITY_ORDER["high"])
+        mediums = sum(1 for severity in severities if severity >= PRIORITY_ORDER["medium"])
+        return highs >= 1 or mediums >= 2
+    return count >= 1
+
+
+def _eval_compound(rule: dict, events: list[RawEvent], now: datetime) -> CandidateAlert | None:
+    if not _match_time_filter(rule.get("time_filter"), now):
+        return None
+    specs = rule.get("signals", [])
+    present: dict[str, int] = {}
+    latest_ts = 0.0
+    for event in events:
+        if not event.active:
+            continue
+        for spec in specs:
+            if not _match_signal(event, spec):
+                continue
+            key = spec if isinstance(spec, str) else spec.get("name", str(spec))
+            severity = PRIORITY_ORDER.get(event.level, PRIORITY_ORDER["medium"])
+            present[str(key)] = max(present.get(str(key), 0), severity)
+            latest_ts = max(latest_ts, event.timestamp)
+    if not present:
+        return None
+    if not _logic_satisfied(rule.get("logic", "any"), list(present.values()), len(specs)):
+        return None
+    return CandidateAlert(
+        rule_name=rule["name"],
+        priority=rule.get("priority", "high"),
+        detector="compound",
+        title=rule.get("title", rule["name"].replace("_", " ").upper()),
+        person_id=None,
+        object_label=None,
+        timestamp=latest_ts,
+        reasons=[f"{key}={_rank_name(rank)}" for key, rank in present.items()],
+        question=rule.get("gate_question"),
+    )
+
+
+def _rank_name(rank: int) -> str:
+    for name, value in PRIORITY_ORDER.items():
+        if value == rank:
+            return name
+    return "medium"
 
 
 # ---------------------------------------------------------------------------

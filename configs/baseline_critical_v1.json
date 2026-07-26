@@ -1,0 +1,11 @@
+{
+  "_comment": "Always-on critical safety baseline. Merged with every customer config so narrow customer policy does not hide universal critical threats. person_down/camera_tampering/fire are first-pass candidate signals and still require gate verification.",
+  "use_case_id": "baseline_critical_v1",
+  "rules": [
+    {"name": "baseline_weapon", "trigger": {"detector": "weapons"}, "priority": "critical"},
+    {"name": "baseline_violence", "trigger": {"detector": "violence"}, "priority": "critical"},
+    {"name": "baseline_person_down", "trigger": {"detector": "person_down"}, "priority": "critical"},
+    {"name": "baseline_camera_tampering", "trigger": {"detector": "camera_tampering"}, "priority": "high"},
+    {"name": "baseline_fire_smoke", "trigger": {"detector": "fire"}, "priority": "critical"}
+  ]
+}

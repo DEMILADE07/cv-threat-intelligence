@@ -1,0 +1,22 @@
+{
+  "_comment": "Compound threat recipes. These fire when several weak/strong signals combine, so robbery does not depend on a lone gun detection in low-quality CCTV.",
+  "use_case_id": "compound_recipes_v1",
+  "rules": [
+    {
+      "name": "armed_robbery",
+      "title": "ARMED ROBBERY IN PROGRESS",
+      "priority": "critical",
+      "signals": ["weapon_candidate", "violence", "running", "person_down", "masked_entry", "counter_rush"],
+      "logic": "one_high_or_two_medium",
+      "gate_question": "Do these frames show an armed robbery or coercive threat in progress: a weapon shown, staff/customers forced or fleeing, a counter rushed, or a person forced to the ground?"
+    },
+    {
+      "name": "violent_theft",
+      "title": "VIOLENT THEFT / GRAB-AND-RUN",
+      "priority": "high",
+      "signals": ["concealment", "violence", "running"],
+      "logic": "at_least_2",
+      "gate_question": "Do these frames show theft escalating to force or a grab-and-run: concealment or grabbing goods combined with a shove, struggle, or someone fleeing?"
+    }
+  ]
+}

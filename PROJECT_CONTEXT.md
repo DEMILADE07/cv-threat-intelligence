@@ -1481,3 +1481,138 @@ VideoMAE local model cache is about 330 MB. X3D-S is about 30 MB, but X3D is not
 - The system still needs multi-alert queue semantics. The live detector still uses a top-alert pattern in the config/gate path.
 - VideoMAE should stay optional and off by default until we validate runtime latency and false-positive behavior on a larger eval set.
 - For shoplifting, the pose/concealment heuristic remains more relevant until we fine-tune a video model on concealment clips.
+
+## Checkpoint 2026-07-12 VideoMAE Gate Wiring Correction
+
+Corrected the live hybrid wiring after an integrated run on `theft_shop_01.mp4` showed spammy, miscategorized `VIOLENCE SUSPECTED` confirmations.
+
+What was wrong:
+- `configs/all_threats_v1.json` ignored `video_action`, while `configs/hybrid_video_action_v1.json` ignored the base detector rules. This made integrated tests confusing.
+- The live detector called `VerificationGate.verify(frame, ...)` with only the current frame, even when VideoMAE had sampled a 16-frame event window around the suspicious moment.
+- `--video-action-cooldown 0` caused overlapping VideoMAE windows and noisy repeated logs.
+- The gate prompt did not have a runtime-specific question for rule name `violence`, so it fell back to a generic "security threat" question and could accept theft evidence as a violence alert.
+
+What changed:
+- `VideoActionRuntime` now stores original BGR frames for VLM/artifacts and RGB frames for VideoMAE.
+- `VideoActionRuntime.last_gate_frames()` exposes the sampled event window so the VLM can see the temporal witness frames.
+- Zero/negative video-action cooldown is normalized to the event window length instead of allowing per-frame spam.
+- `detector.py` now passes the fresh VideoMAE sampled window to the Verification Gate when VideoMAE runs for the current candidate moment.
+- `verification_gate.py` now has stricter category language and rule-specific questions for `violence`, `theft_depart`, `video_action_violence_candidate`, and `video_action_weapon_handling_candidate`.
+- Added `configs/full_hybrid_v1.json` for proper integrated testing: base detector rules plus weak medium-priority VideoMAE witness rules.
+- Added a short Verification Gate candidate queue: if a higher-priority alert is rejected, the detector can verify the next plausible candidate instead of letting a wrong category block the event.
+
+Important remaining limitation:
+- The queue still needs empirical tuning on real clips: candidate limit, repeat cooldown, and per-rule frame selection may need different defaults for retail, banking, estate gates, and low-resolution robbery footage.
+
+## Checkpoint 2026-07-15 V1 Rule Intelligence Pass
+
+Started implementing the next V1 essentials from `plan.md`, adapting the useful Ayo branch ideas into the current flat `unify-detector` path without taking the full `cvti/` package restructure.
+
+What changed:
+- Added `frame_select.py` for per-rule evidence-frame selection:
+  - weapon/object rules use one sharp frame;
+  - violence/assault rules use a short temporal span;
+  - shoplifting/theft/concealment rules use three event frames;
+  - robbery rules can use up to five frames, capped by `--gate-max-frames`.
+- Wired `detector.py` to use per-rule evidence frames from a rolling BGR frame buffer before calling the VLM gate.
+- Added `configs/baseline_critical_v1.json` and `CustomizationEngine(..., baseline_path=...)`.
+- Added detector flags:
+  - `--baseline-config`;
+  - `--no-baseline`.
+- Added compound recipe support in `customization.py`:
+  - rules can define `signals`, `logic`, `title`, and `gate_question`;
+  - `CandidateAlert.question` is now carried into the VLM prompt.
+- Added `configs/compound_recipes_v1.json` with first-pass:
+  - `armed_robbery`;
+  - `violent_theft`.
+- Added detector flags:
+  - `--compound-config`;
+  - `--no-compound`.
+
+Validation:
+- Added focused tests for frame selection, baseline merging, compound recipes, and custom gate questions.
+- Full local unittest suite passed at 29 tests.
+
+Still not implemented:
+- The contributing detectors for tailgating, abandoned object, and wrong-way/unauthorized vehicle.
+- The compound recipe framework can consume those signals once they exist, but it does not create them by itself.
+
+## Checkpoint 2026-07-16 Situational Candidate Detectors Added
+
+Implemented first-pass situational candidate generators in `situational_detectors.py` and wired them into the main `detector.py` Customization Engine path.
+
+What changed:
+- Added `RunningPanicDetector`: uses tracked-person center movement normalized by frame diagonal to emit weak `running` RawEvents.
+- Added `PersonDownDetector`: uses a horizontal body-box heuristic to emit `person_down` RawEvents.
+- Added `CameraTamperDetector`: checks dark, washed-out, or very low-detail frames and emits `camera_tampering` RawEvents.
+- Added `FireSmokeDetector`: checks broad orange/red flame-like regions and gray smoke-like regions and emits `fire` RawEvents.
+- Added `CounterRushDetector`: emits `counter_rush` when a tracked person newly enters zones named like `counter`, `cashier`, `staff`, `restricted`, or `vault`.
+- Added `MaskedEntryCandidateDetector`: emits a low-priority `masked_entry` visual-verification candidate when a person enters zones named like `entrance`, `entry`, `door`, `gate`, or `lobby`.
+- Added `--no-situational` to disable these lightweight candidates during controlled experiments.
+
+Important architecture note:
+- These are **candidate generators**, not final verdicts.
+- They feed `RawEvent -> CustomizationEngine -> CandidateAlert -> VerificationGate`, the same path as weapons, violence, zones, concealment, and VideoMAE.
+- VideoMAE can now be triggered by these situational candidates as a weak temporal witness around the same event moment.
+- The VLM gate remains responsible for confirming whether the candidate actually matches the user/business rule.
+
+Validation:
+- Added `tests/test_situational_detectors.py`.
+- Full local unittest suite passed: 36 tests.
+
+Remaining limitations:
+- These heuristics need real-clip evaluation before being called reliable product rules.
+- `masked_entry` currently depends on zone entry plus VLM verification; there is no dedicated local face-mask detector yet.
+- `counter_rush` requires camera-specific zone files with sensible counter/restricted zone names.
+- `fire/smoke` is color/appearance based and can false-positive on lighting, signage, clothing, or sunsets without VLM/rule filtering.
+- Wrong-way/unauthorized vehicle, power-outage + motion, reliable local mask recognition, and dedicated fence-climbing beyond perimeter-zone entry still need proper candidate generators and tests.
+
+## Checkpoint 2026-07-16 Property-Security Candidate Expansion
+
+Implemented the next V1 property-security candidates recommended after benchmarking against `plan.md`.
+
+What changed:
+- Added `TailgatingDetector`: detects two or more tracked people entering the same entry/gate/door zone within a short time window.
+- Added `AbandonedObjectDetector`: tracks bags/packages/boxes by approximate position and emits `abandoned_object` when the object remains while people are no longer nearby.
+- Added `PerimeterIntrusionDetector`: emits `perimeter_intrusion` when a tracked person enters zones named like `perimeter`, `fence`, `boundary`, or `wall`.
+- Added `CrowdFormationDetector`: emits `crowd_formation` when a close cluster of people forms.
+- Wired all four into `detector.py` under the existing situational-candidate path.
+- Added first-pass `configs/full_hybrid_v1.json` rules for:
+  - `perimeter_intrusion`;
+  - `tailgating`;
+  - `abandoned_object`;
+  - `crowd_formation`.
+- Added VLM gate questions for these rule names so the verifier checks the specific event, not a generic "security threat."
+- Added focused unit coverage in `tests/test_situational_detectors.py`.
+
+Architecture note:
+- These remain candidate generators, not final verdicts.
+- Tailgating and perimeter intrusion require camera-specific zone files with meaningful entry/perimeter zone names.
+- Abandoned-object detection is a first-pass persistence heuristic, not object re-identification.
+- Crowd formation is close-cluster detection, not yet a semantic crowd/panic model.
+
+Remaining V1 gaps after this pass:
+- unauthorized vehicle / wrong-way movement;
+- power-outage + motion combo;
+- dedicated fence-climbing recognition beyond perimeter-zone entry;
+- reliable local mask recognition without relying on VLM confirmation;
+- real labeled evaluation for recall/FPR across all V1 rules.
+
+## Checkpoint 2026-07-26 Interactive Zone Drawer & Multi-Anchor OR-Logic Upgrade
+
+Upgraded spatial zoning capabilities to support custom mouse drawing and multi-point OR-logic anchor matching.
+
+What changed:
+- **Interactive Zone Drawer Tool (`tools/draw_zones.py`)**:
+  - Open any video file, webcam, or RTSP camera stream;
+  - Left-click to place polygon vertices interactively over representative areas (e.g. cashier desk, vault, doorway, shelf);
+  - Right-click to finish drawing and prompt for zone name;
+  - Press 's' to export camera-specific polygon coordinates directly to JSON format.
+- **Multi-Anchor OR-Logic Zoning (`retail_zones.py`)**:
+  - `parse_anchors()` expanded to support `"ALL"`, `"ANY"`, or `"*"` shorthands, mapping to all 8 bounding-box positions (`TOP_LEFT`, `TOP_CENTER`, `TOP_RIGHT`, `CENTER_LEFT`, `CENTER`, `CENTER_RIGHT`, `BOTTOM_LEFT`, `BOTTOM_CENTER`, `BOTTOM_RIGHT`), explicitly excluding `CENTER_OF_MASS` (which requires instance segmentation masks).
+  - `RetailZoneMonitor.update()` refactored to compute `logical_or` across all configured anchors per zone. Unlike Supervision's default `np.all` behavior (which required 100% of anchors to be enclosed), the new OR-matching flags a person as inside the zone if **any single point, corner, or edge of their bounding box** enters or overlaps the polygon.
+  - Fixed `RetailZoneMonitor.annotate()` for multi-anchor zone list rendering.
+- **Client Demo Validation**:
+  - Verified on `theft_shop_01.mp4` and `data/anomaly/196.mp4`.
+  - All 40 unit tests passing cleanly.
+
