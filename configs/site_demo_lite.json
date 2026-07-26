@@ -1,35 +1,29 @@
 {
-  "_comment": "LEAN demo (16-18GB Macs): 3 real CCTV cams \u2014 2 theft (fire alerts) + 1 normal (mostly quiet, shows gate rejecting false alarms). Fresh clip set. Marked configured.",
+  "_comment": "LEAN demo (16-18GB Macs): 3 real CCTV cams — 2 theft (fire alerts) + 1 normal (mostly quiet, shows gate rejecting false alarms). Marked configured.",
   "name": "Demo Store",
   "notify": "console,whatsapp",
   "configured": true,
   "cameras": [
     {
+      "id": "aisle_1",
+      "source": "data/test_clips/theft_shop_01.mp4",
+      "config": "configs/shelf_zones_demo.json",
+      "concealment": true,
+      "video_action": true
+    },
+    {
       "id": "aisle_2",
-      "source": "CamNuvem Robbery Dataset/videos/samples/training/theft/89.mp4",
+      "source": "data/test_clips/theft_shop_02.mp4",
       "config": "configs/shelf_zones_demo.json",
       "concealment": true,
       "video_action": true
     },
     {
       "id": "entrance",
-      "source": "CamNuvem Robbery Dataset/videos/samples/test/normal/Normal_Videos_203_x264.mp4",
+      "source": "data/test_clips/normal_street_01.mp4",
       "config": "configs/all_threats_v1.json",
       "concealment": true,
       "video_action": true
-    },
-    {
-      "id": "aisle_1",
-      "source": "CamNuvem Robbery Dataset/videos/samples/test/theft/226.mp4",
-      "config": "configs/shelf_zones_demo.json",
-      "concealment": true,
-      "video_action": true,
-      "custom_threats": [
-        {
-          "name": "counter-reach",
-          "description": "a person reaches over or leans across the service counter toward the till or shelves"
-        }
-      ]
     }
   ]
 }
