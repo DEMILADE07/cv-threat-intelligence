@@ -100,6 +100,10 @@ _QUESTIONS: dict[str, str] = {
     "theft_attempt": "Does this frame show a person attempting to steal something?",
     "card_skimming_suspect": "Does this frame show suspicious behavior at an ATM or card reader?",
     "after_hours_presence": "Does this frame show unauthorized presence during closed hours?",
+    "baseline_fire_smoke": "Does this frame show visible fire, flames, smoke, or hazardous haze in a {environment_type}?",
+    "fire_smoke": "Does this frame show visible fire, flames, smoke, or hazardous haze in a {environment_type}?",
+    "panic_running": "Does this brief sequence show a person running or moving with panic/urgency in a {environment_type}?",
+    "unsafe_crowd_formation": "Does this frame show an unsafe crowd or tight group formation in a {environment_type}?",
 }
 
 
